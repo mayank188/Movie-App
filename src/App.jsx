@@ -1,4 +1,15 @@
-import React, { useState, useEffect } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { AnimatePresence, motion } from 'framer-motion'
+import { auth, firestore, googleProvider } from './firebase'
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+  updateProfile,
+  onAuthStateChanged,
+} from 'firebase/auth'
+import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore'
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -41,6 +52,53 @@ const NOTES_KEY = 'movieApp.notes'
 const THEME_KEY = 'movieApp.theme'
 const RECENTLY_VIEWED_KEY = 'movieApp.recentlyViewed'
 
+const cardVariants = {
+  hidden: { opacity: 0, y: 24 },
+  visible: { opacity: 1, y: 0, transition: { duration: 0.35 } },
+}
+
+const listVariants = {
+  hidden: {},
+  visible: { transition: { staggerChildren: 0.08, delayChildren: 0.08 } },
+}
+
+const MovieCard = ({ movie }) => {
+  const posterUrl = movie.poster_path ? `https://image.tmdb.org/t/p/w300${movie.poster_path}` : null
+  return (
+    <article className="overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 shadow-lg transition hover:shadow-xl">
+      <div className="relative overflow-hidden bg-slate-900">
+        {posterUrl ? (
+          <img
+            src={posterUrl}
+            alt={movie.title || movie.name}
+            className="h-56 w-full object-cover"
+          />
+        ) : (
+          <div className="flex h-56 items-center justify-center bg-slate-900 text-slate-500">
+            No image available
+          </div>
+        )}
+      </div>
+      <div className="space-y-2 p-4">
+        <div>
+          <h3 className="text-base font-semibold text-white">{movie.title || movie.name}</h3>
+          <p className="text-xs text-slate-500">{movie.release_date || movie.first_air_date || 'Unknown date'}</p>
+        </div>
+        <p className="text-sm leading-6 text-slate-400 line-clamp-3">
+          {movie.overview || 'No description available.'}
+        </p>
+      </div>
+    </article>
+  )
+}
+
+const SidebarCard = ({ title, children }) => (
+  <motion.div variants={cardVariants} className="rounded-4xl border border-slate-800 bg-slate-950/80 p-5 shadow-xl shadow-slate-950/20">
+    <h3 className="text-sm font-semibold uppercase tracking-[0.3em] text-slate-400">{title}</h3>
+    {children}
+  </motion.div>
+)
+
 const App = () => {
   const [movies, setMovies] = useState([])
   const [genres, setGenres] = useState([])
@@ -75,6 +133,205 @@ const App = () => {
   const [surpriseTrailers, setSurpriseTrailers] = useState([])
   const [surpriseLoading, setSurpriseLoading] = useState(false)
   const [pairedMovies, setPairedMovies] = useState([])
+
+  const [user, setUser] = useState(null)
+  const [authModalOpen, setAuthModalOpen] = useState(false)
+  const [authMode, setAuthMode] = useState('login')
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authError, setAuthError] = useState('')
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false)
+  const [userLoading, setUserLoading] = useState(false)
+  const [searchHighlight, setSearchHighlight] = useState(false)
+  const searchInputRef = useRef(null)
+
+  const handleSearchIcon = () => {
+    scrollToSection('search')
+    setSearchHighlight(true)
+    if (searchInputRef.current) {
+      searchInputRef.current.focus()
+    }
+    window.setTimeout(() => setSearchHighlight(false), 2200)
+  }
+
+  const userDisplayName = useMemo(() => {
+    if (!user) return 'Guest'
+    if (user.displayName) return user.displayName
+    return (
+      user.email?.split('@')[0]
+        .replace(/[._]/g, ' ')
+        .replace(/\b\w/g, (char) => char.toUpperCase()) || 'Guest'
+    )
+  }, [user])
+
+  const getMovieKey = (movie) => `${movie.media_type || 'movie'}:${movie.id}`
+  const isSameMovie = (a, b) => getMovieKey(a) === getMovieKey(b)
+
+  const simplifyMovieItem = (movie) => ({
+    id: movie.id,
+    media_type: movie.media_type || 'movie',
+    title: getDisplayTitle(movie),
+    poster_path: movie.poster_path,
+    release_date: movie.release_date || movie.first_air_date || '',
+    vote_average: movie.vote_average || 0,
+    genre_ids: movie.genre_ids || [],
+    overview: movie.overview || '',
+  })
+
+  const persistUserState = async (currentUser) => {
+    if (!currentUser) return
+    try {
+      const userRef = doc(firestore, 'users', currentUser.uid)
+      await setDoc(
+        userRef,
+        {
+          email: currentUser.email,
+          displayName: currentUser.displayName || userDisplayName,
+          watchlist: watchlist.map(simplifyMovieItem),
+          compare: compareMovies.map(simplifyMovieItem),
+          recentlyViewed: recentlyViewed.map((item) => ({
+            ...item,
+            title: item.title || '',
+            media_type: item.media_type || 'movie',
+          })),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true },
+      )
+    } catch (error) {
+      console.error('Error saving user state:', error)
+    }
+  }
+
+  const loadUserProfile = async (currentUser) => {
+    if (!currentUser) return
+    setUserLoading(true)
+    try {
+      const userRef = doc(firestore, 'users', currentUser.uid)
+      const snapshot = await getDoc(userRef)
+      const displayName = currentUser.displayName || currentUser.email?.split('@')[0] || 'User'
+
+      if (snapshot.exists()) {
+        const data = snapshot.data() || {}
+        setWatchlist(data.watchlist || [])
+        setCompareMovies(data.compare || [])
+        setRecentlyViewed(data.recentlyViewed || [])
+        if (!currentUser.displayName) {
+          await updateProfile(currentUser, { displayName })
+        }
+      } else {
+        await setDoc(userRef, {
+          email: currentUser.email,
+          displayName,
+          watchlist: [],
+          compare: [],
+          recentlyViewed: [],
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        })
+        if (!currentUser.displayName) {
+          await updateProfile(currentUser, { displayName })
+        }
+      }
+    } catch (error) {
+      console.error('Error loading profile:', error)
+    } finally {
+      setUserLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser)
+      if (currentUser) {
+        await loadUserProfile(currentUser)
+      } else {
+        setWatchlist([])
+        setCompareMovies([])
+        setRecentlyViewed([])
+      }
+    })
+    return unsubscribe
+  }, [])
+
+  useEffect(() => {
+    if (!profileMenuOpen) return
+    const handleOutsideClick = (event) => {
+      if (!event.target.closest('.profile-menu-root')) {
+        setProfileMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleOutsideClick)
+    return () => document.removeEventListener('mousedown', handleOutsideClick)
+  }, [profileMenuOpen])
+
+  useEffect(() => {
+    if (!user) return
+    persistUserState(user)
+  }, [user, watchlist, compareMovies, recentlyViewed])
+
+  useEffect(() => {
+    if (!user) return
+    if (recentlyViewed.length > 0 && recentlyViewed[0].genre_ids?.length > 0) {
+      const topGenre = recentlyViewed[0].genre_ids[0]
+      fetchRecommendedMovies({ movie: topGenre, tv: topGenre })
+      return
+    }
+    const topKeywords = Object.entries(keywordPreference)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([keyword]) => keyword)
+
+    if (topKeywords.length > 0) {
+      fetchMultiKeywordRecommendations(topKeywords)
+    }
+  }, [user, recentlyViewed])
+
+  const openAuthModal = (mode = 'login') => {
+    setAuthMode(mode)
+    setAuthEmail('')
+    setAuthPassword('')
+    setAuthError('')
+    setAuthModalOpen(true)
+  }
+
+  const handleAuthSubmit = async () => {
+    setAuthError('')
+    if (!authEmail || !authPassword) {
+      setAuthError('Please enter both email and password.')
+      return
+    }
+
+    try {
+      if (authMode === 'login') {
+        await signInWithEmailAndPassword(auth, authEmail, authPassword)
+      } else {
+        await createUserWithEmailAndPassword(auth, authEmail, authPassword)
+      }
+      setAuthModalOpen(false)
+    } catch (error) {
+      setAuthError(error.message || 'Authentication failed')
+    }
+  }
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth)
+    } catch (error) {
+      console.error('Logout error:', error)
+      setAuthError(error.message || 'Logout failed')
+    }
+  }
+
+  const handleGoogleSignIn = async () => {
+    setAuthError('')
+    try {
+      await signInWithPopup(auth, googleProvider)
+      setAuthModalOpen(false)
+    } catch (error) {
+      setAuthError(error.message || 'Google sign-in failed')
+    }
+  }
 
   const moods = {
     Romantic: 10749,
@@ -188,6 +445,8 @@ const App = () => {
       poster_path: movie.poster_path,
       vote_average: movie.vote_average,
       release_date: movie.release_date || movie.first_air_date || '',
+      genre_ids: movie.genre_ids || [],
+      overview: movie.overview || '',
     }
     setRecentlyViewed((prev) => {
       const existing = prev.filter((item) => item.id !== entry.id || item.media_type !== entry.media_type)
@@ -661,38 +920,40 @@ const App = () => {
     }
   }
 
-  const isInWatchlist = (movie) => watchlist.some((item) => item.id === movie.id)
+  const isInWatchlist = (movie) => watchlist.some((item) => isSameMovie(item, movie))
 
   const toggleWatchlist = (movie) => {
     if (isInWatchlist(movie)) {
-      setWatchlist((prev) => prev.filter((item) => item.id !== movie.id))
+      setWatchlist((prev) => prev.filter((item) => !isSameMovie(item, movie)))
       addGenrePreference(movie.genre_ids, -1)
       return
     }
-    setWatchlist((prev) => [movie, ...prev])
+    setWatchlist((prev) => [simplifyMovieItem(movie), ...prev.filter((item) => !isSameMovie(item, movie))])
     addGenrePreference(movie.genre_ids)
   }
 
-  const isInCompare = (movie) => compareMovies.some((item) => item.id === movie.id)
+  const isInCompare = (movie) => compareMovies.some((item) => isSameMovie(item, movie))
 
   const toggleCompare = (movie) => {
     if (isInCompare(movie)) {
-      setCompareMovies((prev) => prev.filter((item) => item.id !== movie.id))
+      setCompareMovies((prev) => prev.filter((item) => !isSameMovie(item, movie)))
       return
     }
     if (compareMovies.length >= 3) {
       alert('Please remove one movie before adding another to compare.')
       return
     }
-    setCompareMovies((prev) => [movie, ...prev])
+    setCompareMovies((prev) => [simplifyMovieItem(movie), ...prev.filter((item) => !isSameMovie(item, movie))])
   }
 
-  const removeFromCompare = (movieId) => {
-    setCompareMovies((prev) => prev.filter((movie) => movie.id !== movieId))
+  const removeFromCompare = (movieOrId, mediaType = 'movie') => {
+    const key = typeof movieOrId === 'object' ? getMovieKey(movieOrId) : `${mediaType}:${movieOrId}`
+    setCompareMovies((prev) => prev.filter((movie) => getMovieKey(movie) !== key))
   }
 
-  const removeFromWatchlist = (movieId) => {
-    setWatchlist((prev) => prev.filter((movie) => movie.id !== movieId))
+  const removeFromWatchlist = (movieOrId, mediaType = 'movie') => {
+    const key = typeof movieOrId === 'object' ? getMovieKey(movieOrId) : `${mediaType}:${movieOrId}`
+    setWatchlist((prev) => prev.filter((movie) => getMovieKey(movie) !== key))
   }
 
   const updateMovieNote = (movieId, field, value) => {
@@ -709,54 +970,30 @@ const App = () => {
     const providers = movieProviders[movie.id] || []
     const loading = providerLoading[movie.id]
     if (loading) {
-      return <p className="text-xs text-blue-300 mt-1">Checking streaming availability...</p>
+      return <p className="text-[11px] text-sky-300 mt-2">Checking streaming availability...</p>
     }
     if (providers.length === 0) {
       return (
-        <p className="text-xs text-red-400 mt-1">No streaming providers found (region may be unavailable). Click "Free Streaming" again or visit View Details.</p>
+        <p className="text-[11px] text-red-400 mt-2">
+          No streaming providers found (region may be unavailable). Click “Free Streaming” again or visit View Details.
+        </p>
       )
     }
     const freeProviders = providers.filter((p) => p.type === 'free')
     const nonFreeProviders = providers.filter((p) => p.type !== 'free')
     if (freeProviders.length > 0) {
       return (
-        <div className="mt-1">
-          <p className="text-xs text-green-400">Free available on:</p>
-          <div className="flex flex-wrap gap-1 mt-1">
-            {freeProviders.map((provider) => (
-              <a
-                key={provider.provider_id}
-                href={`https://www.google.com/search?q=${encodeURIComponent(`${getDisplayTitle(movie)} on ${provider.provider_name}`)}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-xs bg-green-800 px-1 py-0.5 rounded hover:bg-green-700"
-              >
-                {provider.provider_name}
-              </a>
-            ))}
-          </div>
+        <div className="mt-2 space-y-1">
+          <p className="text-[11px] text-emerald-300">Free on {freeProviders.map((p) => p.provider_name).join(', ')}</p>
           {nonFreeProviders.length > 0 && (
-            <p className="text-xs text-yellow-300 mt-1">Also available (pay): {nonFreeProviders.map((p) => p.provider_name).join(', ')}</p>
+            <p className="text-[11px] text-slate-400">Also available on: {nonFreeProviders.map((p) => p.provider_name).join(', ')}</p>
           )}
         </div>
       )
     }
     return (
-      <div className="mt-1">
-        <p className="text-xs text-red-400">Not freely available; available on:</p>
-        <div className="flex flex-wrap gap-1 mt-1">
-          {nonFreeProviders.map((provider) => (
-            <a
-              key={provider.provider_id}
-              href={`https://www.google.com/search?q=${encodeURIComponent(`${getDisplayTitle(movie)} on ${provider.provider_name}`)}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-xs bg-orange-800 px-1 py-0.5 rounded hover:bg-orange-700"
-            >
-              {provider.provider_name}
-            </a>
-          ))}
-        </div>
+      <div className="mt-2">
+        <p className="text-[11px] text-slate-400">Available on {nonFreeProviders.map((p) => p.provider_name).join(', ')}</p>
       </div>
     )
   }
@@ -775,7 +1012,7 @@ const App = () => {
     }, [movie.id, movie.media_type])
 
     return (
-      <div className="bg-zinc-900 rounded-3xl overflow-hidden shadow-xl transition-transform duration-300 hover:-translate-y-1">
+      <div className="w-full max-w-[340px] mx-auto bg-slate-900 rounded-3xl overflow-hidden shadow-xl transition-transform duration-300 hover:-translate-y-1 hover:shadow-2xl">
         {imagePath ? (
           <img
             src={`https://image.tmdb.org/t/p/w300${imagePath}`}
@@ -785,37 +1022,53 @@ const App = () => {
         ) : (
           <div className="flex h-72 items-center justify-center bg-slate-800 text-slate-400">Image not available</div>
         )}
-        <div className="p-5">
-          <div className="mb-3 flex flex-wrap gap-2 text-xs text-gray-300">
-            <span className="bg-slate-800 rounded-full px-3 py-1">{movie.media_type === 'tv' ? 'Series' : 'Movie'}</span>
-            <span className="bg-slate-800 rounded-full px-3 py-1">{getDisplayDate(movie)}</span>
-            <span className="bg-slate-800 rounded-full px-3 py-1">{movie.vote_average}/10</span>
+        <div className="space-y-4 p-5">
+          <div className="flex flex-wrap gap-2 text-[11px] text-slate-300">
+            <span className="rounded-full bg-slate-800 px-3 py-1">{movie.media_type === 'tv' ? 'Series' : 'Movie'}</span>
+            <span className="rounded-full bg-slate-800 px-3 py-1">{getDisplayDate(movie)}</span>
+            <span className="rounded-full bg-slate-800 px-3 py-1">{movie.vote_average?.toFixed(1) ?? '–'}/10</span>
+          </div>
+
+          <div className="flex flex-wrap gap-2 text-[11px]">
             {movie.genre_ids?.length > 0 && (
-              <span className="bg-slate-800 rounded-full px-3 py-1">{getGenreNames(movie.genre_ids)}</span>
+              <span className="rounded-full bg-slate-800 px-3 py-1 text-slate-300">
+                {getGenreNames(movie.genre_ids)}
+              </span>
             )}
-            {movie.media_type === 'tv' && (
-              <span className="bg-slate-800 rounded-full px-3 py-1">Seasons: {tvInfo?.number_of_seasons ?? '...'}</span>
+            {movie.media_type === 'tv' && tvInfo?.number_of_seasons != null && (
+              <span className="rounded-full bg-slate-800 px-3 py-1 text-slate-300">
+                Seasons: {tvInfo.number_of_seasons}
+              </span>
             )}
           </div>
-          <h3 className="text-lg font-semibold mb-2">{getDisplayTitle(movie)}</h3>
-          <p className="text-sm text-gray-400 mb-3 overflow-hidden" style={{ maxHeight: '6rem' }}>{shortOverview}</p>
+
+          <div className="space-y-2">
+            <h3 className="text-lg font-semibold text-white">{getDisplayTitle(movie)}</h3>
+            <p className="text-sm leading-6 text-slate-400 line-clamp-3">{shortOverview}</p>
+          </div>
+
           <div className="grid gap-2 sm:grid-cols-2">
             <button
+              type="button"
               onClick={() => fetchWatchProviders(movie.id, movie.media_type || 'movie')}
-              className="w-full px-3 py-2 bg-emerald-600 rounded-2xl text-sm font-medium hover:bg-emerald-500"
+              className="w-full rounded-2xl bg-emerald-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-emerald-500"
             >
               Free Streaming
             </button>
             <button
+              type="button"
               onClick={() => fetchTrailer(movie)}
-              className="w-full px-3 py-2 bg-sky-600 rounded-2xl text-sm font-medium hover:bg-sky-500"
+              className="w-full rounded-2xl bg-sky-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-sky-400"
             >
               Trailer Preview
             </button>
+          </div>
+
+          <div className="grid gap-2 sm:grid-cols-2">
             <button
               type="button"
               onClick={() => toggleWatchlist(movie)}
-              className={`w-full px-3 py-2 rounded-2xl text-sm font-medium ${isInWatchlist(movie) ? 'bg-yellow-500 text-slate-900 hover:bg-yellow-400' : 'bg-slate-700 hover:bg-slate-600'}`}
+              className={`w-full rounded-2xl px-3 py-2 text-sm font-semibold transition ${isInWatchlist(movie) ? 'bg-amber-500 text-slate-950 hover:bg-amber-400' : 'bg-slate-800 text-slate-100 hover:bg-slate-700'}`}
             >
               {isInWatchlist(movie) ? 'Saved' : 'Watchlist'}
             </button>
@@ -823,26 +1076,29 @@ const App = () => {
               type="button"
               onClick={() => toggleCompare(movie)}
               disabled={!isInCompare(movie) && compareMovies.length >= 3}
-              className={`w-full px-3 py-2 rounded-2xl text-sm font-medium ${isInCompare(movie) ? 'bg-indigo-500 hover:bg-indigo-400' : 'bg-slate-700 hover:bg-slate-600'} ${!isInCompare(movie) && compareMovies.length >= 3 ? 'cursor-not-allowed opacity-50' : ''}`}
+              className={`w-full rounded-2xl px-3 py-2 text-sm font-semibold transition ${isInCompare(movie) ? 'bg-indigo-500 text-white hover:bg-indigo-400' : 'bg-slate-800 text-slate-100 hover:bg-slate-700'} ${!isInCompare(movie) && compareMovies.length >= 3 ? 'cursor-not-allowed opacity-50' : ''}`}
             >
-              {isInCompare(movie) ? 'Comparing' : compareMovies.length >= 3 ? 'Full' : 'Compare'}
+              {isInCompare(movie) ? 'Comparing' : 'Compare'}
             </button>
           </div>
+
           {note?.rating || note?.note ? (
-            <div className="mt-4 rounded-2xl bg-slate-950 p-3 text-sm text-slate-200">
+            <div className="rounded-2xl bg-slate-950 p-3 text-xs text-slate-200">
               <div className="flex items-center gap-2">
                 {note?.rating ? <span>Your Rating: {note.rating}★</span> : <span className="text-slate-400">No rating yet</span>}
               </div>
               {note?.note && <p className="mt-2 text-slate-400">“{note.note}”</p>}
             </div>
           ) : null}
-          {renderProviderSection(movie)}
+
+          <div>{renderProviderSection(movie)}</div>
+
           <a
             href={`https://www.themoviedb.org/${movie.media_type === 'tv' ? 'tv' : 'movie'}/${movie.id}`}
             target="_blank"
             rel="noopener noreferrer"
             onClick={() => addToRecentlyViewed(movie)}
-            className="mt-4 inline-block w-full text-center rounded-2xl bg-slate-800 px-4 py-2 text-sm font-medium text-sky-300 hover:bg-slate-700"
+            className="mt-2 inline-flex w-full items-center justify-center rounded-2xl bg-slate-800 px-4 py-3 text-sm font-semibold text-slate-100 transition hover:bg-slate-700"
           >
             View Details
           </a>
@@ -875,155 +1131,299 @@ const App = () => {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
-      <div className="mx-auto max-w-7xl px-4 py-8">
-        <header className="mb-10">
-          <div className="flex flex-col gap-6 rounded-4xl border border-slate-800 bg-slate-950/70 p-8 shadow-2xl md:flex-row md:items-center md:justify-between">
+      <div className="fixed inset-x-0 top-0 z-30 border-b border-slate-800 bg-slate-950/95 backdrop-blur-xl">
+        <div className="w-full flex items-center justify-between gap-4 px-4 sm:px-6 py-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-violet-500 text-xl font-bold text-white shadow-xl shadow-violet-500/20">M</div>
             <div>
-              <p className="text-xs uppercase tracking-[0.4em] text-rose-400">Movie Discovery Hub</p>
-              <h1 className="mt-3 text-4xl font-semibold tracking-tight text-white sm:text-5xl">Movie Explorer</h1>
-              <p className="mt-4 max-w-2xl text-sm text-slate-300 sm:text-base">
-                Discover films, save favorites, compare choices, and preview trailers in one elegant experience.
-              </p>
-            </div>
-            <nav className="flex flex-wrap items-center gap-3">
-              <button
-                type="button"
-                onClick={() => scrollToSection('discover')}
-                className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100 ring-1 ring-slate-800 hover:bg-slate-800"
-              >
-                Discover
-              </button>
-              <button
-                type="button"
-                onClick={() => scrollToSection('watchlist')}
-                className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100 ring-1 ring-slate-800 hover:bg-slate-800"
-              >
-                Watchlist
-              </button>
-              <button
-                type="button"
-                onClick={() => scrollToSection('compare')}
-                className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100 ring-1 ring-slate-800 hover:bg-slate-800"
-              >
-                Compare
-              </button>
-              <button
-                type="button"
-                onClick={pickSurpriseMovie}
-                className="rounded-full bg-violet-600 px-4 py-2 text-sm text-white hover:bg-violet-500"
-              >
-                Surprise Me
-              </button>
-            </nav>
-          </div>
-
-          <div className="mt-8 grid gap-4 sm:grid-cols-2">
-            <div className="rounded-4xl border border-slate-800 bg-slate-950/70 p-6 shadow-lg">
-              <p className="text-sm uppercase tracking-[0.2em] text-slate-400">Current session</p>
-              <div className="mt-4 flex flex-wrap gap-3">
-                <span className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100">Page {page}</span>
-                <span className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100">Watchlist {watchlist.length}</span>
-                <span className="rounded-full bg-slate-900 px-4 py-2 text-sm text-slate-100">Compare {compareMovies.length}/3</span>
-              </div>
-            </div>
-            <div className="rounded-4xl border border-slate-800 bg-slate-950/70 p-6 shadow-lg">
-              <h2 className="text-xl font-semibold text-white">What’s new?</h2>
-              <p className="mt-3 text-sm text-slate-300">Use the filters below to find movies quickly, or press Surprise Me for a fast recommendation with pairing suggestions.</p>
+              <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Movie Studio</p>
+              <p className="text-sm font-semibold text-white">CineFlow</p>
             </div>
           </div>
 
-          <div className="mt-8 rounded-4xl border border-slate-800 bg-slate-950/70 p-6 shadow-xl">
-            <h3 className="text-xl font-semibold text-white">Search and explore</h3>
-            <p className="mt-2 text-sm text-slate-400">Find movies or web series quickly, clear the search, or filter by mood and genre. Search results appear right under this panel.</p>
-            <div className="mt-6 grid gap-4 lg:grid-cols-[1.8fr_1.2fr]">
-              <div className="grid gap-4">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:flex-1">
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') handleSearch()
-                      }}
-                      placeholder="Search for movies or web series by title..."
-                      className="h-14 flex-1 rounded-3xl border border-slate-800 bg-slate-900 px-4 text-sm text-slate-100 focus:border-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500/30"
-                    />
-                    <button
-                      onClick={handleSearch}
-                      className="h-14 rounded-3xl bg-rose-600 px-6 text-sm font-semibold text-white hover:bg-rose-500"
-                    >
-                      Search
-                    </button>
-                  </div>
-                  <div className="flex flex-wrap gap-5 items-center">
-                    <button
-                      onClick={() => setContentType('all')}
-                      className={`rounded-3xl px-5 py-3 text-sm font-semibold ${contentType === 'all' ? 'bg-violet-600 text-white' : 'bg-slate-900 text-slate-100 hover:bg-slate-800'}`}
-                    >
-                      All
-                    </button>
-                    <button
-                      onClick={() => setContentType('movie')}
-                      className={`rounded-3xl px-5 py-3 text-sm font-semibold ${contentType === 'movie' ? 'bg-violet-600 text-white' : 'bg-slate-900 text-slate-100 hover:bg-slate-800'}`}
-                    >
-                      Movies
-                    </button>
-                    <button
-                      onClick={() => setContentType('tv')}
-                      className={`rounded-3xl px-5 py-3 text-sm font-semibold ${contentType === 'tv' ? 'bg-violet-600 text-white' : 'bg-slate-900 text-slate-100 hover:bg-slate-800'}`}
-                    >
-                      Webseries
-                    </button>
+          <nav className="hidden items-center gap-3 text-sm text-slate-300 md:flex">
+            <button
+              type="button"
+              onClick={() => scrollToSection('discover')}
+              className="rounded-full px-3 py-2 transition hover:bg-slate-800 hover:text-white"
+            >
+              Discover
+            </button>
+            <button
+              type="button"
+              onClick={() => scrollToSection('watchlist')}
+              className="rounded-full px-3 py-2 transition hover:bg-slate-800 hover:text-white"
+            >
+              Watchlist
+            </button>
+            <button
+              type="button"
+              onClick={() => scrollToSection('compare')}
+              className="rounded-full px-3 py-2 transition hover:bg-slate-800 hover:text-white"
+            >
+              Compare
+            </button>
+            <button
+              type="button"
+              onClick={pickSurpriseMovie}
+              className="rounded-full bg-violet-600 px-4 py-2 text-white transition hover:bg-violet-500"
+            >
+              Surprise Me
+            </button>
+          </nav>
+
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handleSearchIcon}
+              className="inline-flex h-12 w-12 items-center justify-center rounded-full border border-slate-800 bg-slate-900 text-lg text-slate-100 transition duration-300 hover:-translate-y-0.5 hover:scale-110 hover:border-violet-500 hover:text-violet-300 hover:shadow-[0_0_18px_rgba(139,92,246,0.25)]"
+              aria-label="Search"
+            >
+              🔍
+            </button>
+            <div className="relative profile-menu-root">
+              <button
+                type="button"
+                onClick={() => setProfileMenuOpen((prev) => !prev)}
+                className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-violet-500 text-lg font-bold text-white shadow-xl shadow-violet-500/30 transition hover:bg-violet-400"
+              >
+                {user?.photoURL ? (
+                  <img src={user.photoURL} alt="Profile" className="h-10 w-10 rounded-full object-cover" />
+                ) : (
+                  userDisplayName[0]?.toUpperCase() || 'U'
+                )}
+              </button>
+              {profileMenuOpen && (
+                <div className="absolute right-0 mt-3 w-80 overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 p-4 text-sm shadow-2xl">
+                  {user ? (
+                    <>
+                      <div className="mb-4 flex items-center gap-3 border-b border-slate-800 pb-4">
+                        <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-violet-500 text-lg font-bold text-white">
+                          {userDisplayName[0]?.toUpperCase() || 'U'}
+                        </div>
+                        <div>
+                          <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Signed in as</p>
+                          <p className="truncate text-base font-semibold text-white">{userDisplayName}</p>
+                          <p className="text-xs text-slate-500">{user.email}</p>
+                        </div>
+                      </div>
+                      <div className="space-y-2">
+                        <button
+                          type="button"
+                          onClick={() => setProfileMenuOpen(false)}
+                          className="w-full rounded-2xl bg-slate-900 px-4 py-3 text-left text-sm text-slate-100 transition hover:bg-slate-800"
+                        >
+                          Profile
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setProfileMenuOpen(false)}
+                          className="w-full rounded-2xl bg-slate-900 px-4 py-3 text-left text-sm text-slate-100 transition hover:bg-slate-800"
+                        >
+                          Settings
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleLogout}
+                          className="w-full rounded-2xl bg-rose-600 px-4 py-3 text-left text-sm text-white transition hover:bg-rose-500"
+                        >
+                          Logout
+                        </button>
+                      </div>
+                      <div className="mt-4 rounded-3xl bg-slate-900 p-4">
+                        <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Activity</p>
+                        <div className="mt-3 grid gap-2 text-xs text-slate-200">
+                          <span className="rounded-2xl bg-slate-950 px-3 py-2">Watchlist {watchlist.length}</span>
+                          <span className="rounded-2xl bg-slate-950 px-3 py-2">Compare {compareMovies.length}</span>
+                          <span className="rounded-2xl bg-slate-950 px-3 py-2">History {recentlyViewed.length}</span>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="mb-4 border-b border-slate-800 pb-4">
+                        <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Welcome</p>
+                        <p className="mt-2 text-base font-semibold text-white">Login or sign up to personalize recommendations.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => { setProfileMenuOpen(false); openAuthModal('login') }}
+                        className="w-full rounded-2xl bg-violet-600 px-4 py-3 text-left text-sm text-white transition hover:bg-violet-500"
+                      >
+                        Login
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => { setProfileMenuOpen(false); openAuthModal('signup') }}
+                        className="mt-3 w-full rounded-2xl bg-slate-900 px-4 py-3 text-left text-sm text-slate-100 transition hover:bg-slate-800"
+                      >
+                        Sign Up
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="w-full px-4 sm:px-9 pt-16 pb-6">
+        <header className="mb-8">
+          <div className="mt-6 flex flex-col gap-4 lg:flex-row lg:items-stretch">
+            <div className="flex-1 rounded-4xl border border-slate-800 bg-slate-950/70 p-6 shadow-2xl">
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <p className="text-2xs uppercase tracking-[0.4em] text-rose-400">Movie Discovery Hub</p>
+                    <h1 className="mt-2 text-3xl font-semibold tracking-tight text-white sm:text-4xl">Movie Explorer</h1>
+                    <p className="mt-3 max-w-2xl text-sm text-slate-300">
+                      {user ? `Welcome back, ${userDisplayName}. Your personalized recommendations are ready.` : 'Discover films, save favorites, compare choices, and preview trailers in one elegant experience.'}
+                    </p>
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-3">
                   <button
-                    onClick={handleClearSearch}
-                    className="rounded-3xl border border-slate-800 bg-slate-900 px-5 py-3 text-sm text-slate-100 hover:bg-slate-800"
+                    type="button"
+                    onClick={() => scrollToSection('discover')}
+                    className="rounded-full bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-violet-500/20 transition hover:bg-violet-500"
                   >
-                    Clear search
+                    Explore Top Picks
                   </button>
                   <button
+                    type="button"
+                    onClick={pickSurpriseMovie}
+                    className="rounded-full border border-slate-800 bg-slate-900 px-5 py-2.5 text-sm text-slate-100 transition hover:border-violet-500 hover:text-white"
+                  >
+                    Surprise Me
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div className="lg:w-[32%]">
+              <div className="h-full rounded-4xl border border-slate-800 bg-slate-950/70 p-5 shadow-lg">
+                <h2 className="text-lg font-semibold text-white">What’s new?</h2>
+                <p className="mt-2 text-sm leading-relaxed text-slate-300">Use the filters below to find movies quickly, or press Surprise Me for a fast recommendation with pairing suggestions.</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-6 w-full px-4 sm:px-6">
+            <motion.div
+              id="search"
+              className={`w-full rounded-[2rem] border border-white/10 bg-slate-950/90 backdrop-blur-xl p-4 shadow-[0_20px_60px_rgba(15,23,42,0.3)] transition duration-500 ${searchHighlight ? 'border-violet-400/60 shadow-[0_0_40px_rgba(139,92,246,0.18)]' : ''}`}
+              initial="hidden"
+              animate="visible"
+              variants={cardVariants}
+            >
+              <div className="space-y-4">
+                <div className="text-center space-y-2">
+                  <p className="text-xs uppercase tracking-[0.3em] text-violet-300">Search & discover</p>
+                  <h3 className="text-2xl font-semibold tracking-tight text-white">Find your next movie</h3>
+                  <p className="mx-auto text-sm leading-6 text-slate-400">
+                    Search by title, then refine with filters to get better results.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-3 w-full">
+                  <div className="flex min-w-0 w-full items-center gap-3 flex-1">
+                    <div className="relative flex-1 min-w-0">
+                      <span className="pointer-events-none absolute inset-y-0 left-4 flex items-center text-xl text-slate-400">🔍</span>
+                      <input
+                        ref={searchInputRef}
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') handleSearch()
+                        }}
+                        placeholder="Search movies, series, or keywords..."
+                        className="h-14 w-full min-w-0 rounded-full border border-slate-800/70 bg-slate-900/85 px-14 pr-4 text-sm text-slate-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.05)] transition duration-300 focus:border-violet-400 focus:bg-slate-900/95 focus:outline-none focus:ring-2 focus:ring-violet-400/30"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleSearch}
+                      className="h-14 rounded-full bg-violet-600 px-6 text-sm font-semibold text-white transition duration-300 hover:scale-[1.02] hover:bg-violet-500 focus:outline-none focus:ring-2 focus:ring-violet-400/40"
+                    >
+                      Search
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setContentType('all')}
+                      className={`h-12 rounded-full px-4 text-sm font-semibold transition duration-300 ${contentType === 'all' ? 'bg-gradient-to-r from-violet-600 to-fuchsia-500 text-white shadow-lg shadow-fuchsia-500/20' : 'bg-slate-900 text-slate-100 ring-1 ring-slate-800 hover:bg-slate-800'}`}
+                    >
+                      All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setContentType('movie')}
+                      className={`h-12 rounded-full px-4 text-sm font-semibold transition duration-300 ${contentType === 'movie' ? 'bg-violet-600 text-white shadow-lg shadow-violet-500/20' : 'bg-slate-900 text-slate-100 ring-1 ring-slate-800 hover:bg-slate-800'}`}
+                    >
+                      Movies
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setContentType('tv')}
+                      className={`h-12 rounded-full px-4 text-sm font-semibold transition duration-300 ${contentType === 'tv' ? 'bg-violet-600 text-white shadow-lg shadow-violet-500/20' : 'bg-slate-900 text-slate-100 ring-1 ring-slate-800 hover:bg-slate-800'}`}
+                    >
+                      Webseries
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      value={selectedMood}
+                      onChange={(e) => handleMoodSelect(e.target.value)}
+                      className="h-12 min-w-[150px] rounded-full border border-slate-800 bg-slate-900 px-4 pr-8 text-sm text-slate-100 transition duration-300 focus:border-violet-400 focus:outline-none focus:ring-2 focus:ring-violet-400/30"
+                    >
+                      <option value="">Mood</option>
+                      {Object.keys(moods).map((mood) => (
+                        <option key={mood} value={mood}>
+                          {mood}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={selectedGenre}
+                      onChange={(e) => handleGenreSelect(e.target.value)}
+                      className="h-12 min-w-[150px] rounded-full border border-slate-800 bg-slate-900 px-4 pr-8 text-sm text-slate-100 transition duration-300 focus:border-violet-400 focus:outline-none focus:ring-2 focus:ring-violet-400/30"
+                    >
+                      <option value="">Genre</option>
+                      {availableGenres.map((genre) => (
+                        <option key={genre.id} value={genre.id}>
+                          {genre.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={handleClearSearch}
+                    className="h-12 rounded-full bg-slate-900 px-5 text-sm font-semibold text-slate-200 ring-1 ring-slate-800 transition duration-300 hover:bg-slate-800 hover:scale-[1.02]"
+                  >
+                    Clear Search
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setShowAllMovies((prev) => !prev)}
-                    className="rounded-3xl bg-sky-600 px-5 py-3 text-sm font-semibold text-white hover:bg-sky-500"
+                    className="h-12 rounded-full bg-slate-900 px-5 text-sm font-semibold text-slate-200 ring-1 ring-slate-800 transition duration-300 hover:bg-slate-800 hover:scale-[1.02]"
                   >
                     {showAllMovies ? 'Hide Grid' : 'Show Grid'}
                   </button>
                 </div>
               </div>
-              <div className="grid gap-3 sm:grid-cols-2 items-end">
-                <select
-                  value={selectedMood}
-                  onChange={(e) => handleMoodSelect(e.target.value)}
-                  className="h-14 rounded-3xl border border-slate-800 bg-slate-900 px-4 pr-10 text-sm text-slate-100 appearance-none focus:border-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500/30"
-                >
-                  <option value="">Select Mood</option>
-                  {Object.keys(moods).map((mood) => (
-                    <option key={mood} value={mood}>
-                      {mood}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  value={selectedGenre}
-                  onChange={(e) => handleGenreSelect(e.target.value)}
-                  className="h-14 rounded-3xl border border-slate-800 bg-slate-900 px-4 pr-10 text-sm text-slate-100 appearance-none focus:border-rose-500 focus:outline-none focus:ring-2 focus:ring-rose-500/30"
-                >
-                  <option value="">Select Genre</option>
-                  {availableGenres.map((genre) => (
-                    <option key={genre.id} value={genre.id}>
-                      {genre.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
+            </motion.div>
           </div>
         </header>
 
         {isSearching && searchQuery.trim() && (
-          <div className="mb-8 rounded-4xl border border-slate-800 bg-slate-950/70 p-6 shadow-xl">
+          <div className="mb-8 rounded-4xl border border-slate-800 bg-slate-950/70 p-4 shadow-xl">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h3 className="text-xl font-semibold text-white">Search results</h3>
@@ -1037,10 +1437,17 @@ const App = () => {
                 Clear search
               </button>
             </div>
-            <div className="mt-6 grid gap-6 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="mt-6 grid justify-items-center grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
               {movies.length > 0 ? (
                 movies.map((movie) => (
-                  <MovieCard key={movie.id} movie={movie} />
+                  <MovieCard
+                    key={`${movie.media_type}-${movie.id}`}
+                    movie={movie}
+                    isSaved={isInWatchlist(movie)}
+                    isCompared={isInCompare(movie)}
+                    onToggleWatchlist={() => toggleWatchlist(movie)}
+                    onToggleCompare={() => toggleCompare(movie)}
+                  />
                 ))
               ) : (
                 <div className="rounded-3xl border border-slate-800 bg-slate-900 p-6 text-slate-400">No movies found for this search.</div>
@@ -1050,24 +1457,11 @@ const App = () => {
         )}
 
         {!selectedMood && !selectedGenre && !isSearching && displayedRecommendedMovies.length > 0 && (
-          <div className="mb-8 rounded-4xl border border-yellow-500 bg-slate-950/80 p-6 shadow-2xl">
+          <div className="mb-8 w-full rounded-4xl border border-yellow-500 bg-slate-950/80 p-4 shadow-2xl">
             <h2 className="text-2xl font-bold text-center mb-6 text-yellow-400">
               Recommended {contentType === 'all' ? 'movies and series' : contentType === 'tv' ? 'series' : 'movies'} {selectedMood ? `for ${selectedMood}` : selectedGenre && genres.length > 0 ? `in ${genres.find((g) => g.id == selectedGenre)?.name}` : ''}
             </h2>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              {displayedRecommendedMovies.map((movie) => (
-                <MovieCard key={movie.id} movie={movie} />
-              ))}
-            </div>
-          </div>
-        )}
-
-        {(selectedMood || selectedGenre) && displayedRecommendedMovies.length > 0 && (
-          <div className="mb-8 rounded-4xl border border-yellow-500 bg-slate-950/80 p-6 shadow-2xl">
-            <h2 className="text-2xl font-bold text-center mb-6 text-yellow-400">
-              Top 3 {selectedLabel ? `${selectedLabel} picks` : 'recommended picks'}
-            </h2>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="grid justify-items-center grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {displayedRecommendedMovies.map((movie) => (
                 <MovieCard key={movie.id} movie={movie} />
               ))}
@@ -1076,14 +1470,14 @@ const App = () => {
         )}
 
         {(selectedMood || selectedGenre) && (
-          <div className="mb-8 rounded-4xl border border-slate-800 bg-slate-950/80 p-6 shadow-2xl">
+          <div className="mb-8 rounded-4xl border border-slate-800 bg-slate-950/80 p-4 shadow-2xl">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <h3 className="text-xl font-semibold text-white">All related {contentType === 'tv' ? 'series' : contentType === 'all' ? 'movies and series' : 'movies'} for {selectedLabel}</h3>
                 <p className="mt-2 text-sm text-slate-400">Browse every {contentType === 'tv' ? 'series' : contentType === 'all' ? 'movie or series' : 'movie'} matching this mood or genre.</p>
               </div>
             </div>
-            <div className="mt-6 grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div className="mt-6 grid justify-items-center grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
               {relatedMovies.length > 0 ? (
                 relatedMovies.map((movie) => <MovieCard key={movie.id} movie={movie} />)
               ) : (
@@ -1192,7 +1586,7 @@ const App = () => {
         )}
 
         {watchlist.length > 0 && (
-          <div id="watchlist" className="mb-8 max-w-7xl mx-auto rounded-4xl border border-cyan-500 bg-slate-950/80 p-6 shadow-2xl">
+          <div id="watchlist" className="w-full mb-8 rounded-4xl border border-cyan-500 bg-slate-950/80 p-4 shadow-2xl">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-6">
               <div>
                 <h2 className="text-2xl font-bold text-cyan-300">My Watchlist</h2>
@@ -1353,6 +1747,68 @@ const App = () => {
         <p className="text-sm">Movie Explorer is built for fast browsing, smart recommendations, and a beautiful movie-watching planning experience.</p>
       </footer>
       </div>
+
+      {authModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-lg rounded-4xl border border-white/10 bg-slate-950 p-8 text-slate-100 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-xs uppercase tracking-[0.35em] text-rose-400">Account access</p>
+                <h2 className="mt-3 text-3xl font-semibold">{authMode === 'login' ? 'Login' : 'Sign Up'}</h2>
+              </div>
+              <button type="button" onClick={() => setAuthModalOpen(false)} className="text-slate-400 hover:text-white">
+                Close
+              </button>
+            </div>
+            <div className="mt-8 grid gap-5">
+              <div className="grid gap-3">
+                <label className="text-sm text-slate-300">Email</label>
+                <input
+                  type="email"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  className="w-full rounded-3xl border border-slate-800 bg-slate-900 px-4 py-3 text-sm text-slate-100 outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20"
+                />
+              </div>
+              <div className="grid gap-3">
+                <label className="text-sm text-slate-300">Password</label>
+                <input
+                  type="password"
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  className="w-full rounded-3xl border border-slate-800 bg-slate-900 px-4 py-3 text-sm text-slate-100 outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/20"
+                />
+              </div>
+              {authError && (
+                <div className="rounded-3xl bg-rose-500/10 px-4 py-3 text-sm text-rose-200">{authError}</div>
+              )}
+              <div className="grid gap-3">
+                <button
+                  type="button"
+                  onClick={handleAuthSubmit}
+                  className="rounded-3xl bg-violet-600 px-6 py-4 text-sm font-semibold text-white hover:bg-violet-500"
+                >
+                  {authMode === 'login' ? 'Login' : 'Create account'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleGoogleSignIn}
+                  className="rounded-3xl border border-slate-800 bg-slate-900 px-6 py-4 text-sm font-semibold text-slate-100 hover:border-violet-500"
+                >
+                  Continue with Google
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openAuthModal(authMode === 'login' ? 'signup' : 'login')}
+                  className="rounded-3xl border border-slate-800 bg-slate-900 px-6 py-4 text-sm font-semibold text-slate-100 hover:border-violet-500"
+                >
+                  {authMode === 'login' ? 'Switch to Sign Up' : 'Switch to Login'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showTrailerModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
